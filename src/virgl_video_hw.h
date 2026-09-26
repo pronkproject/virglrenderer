@@ -42,8 +42,47 @@
 
 #include <stdint.h>
 
+/* Wire values retain the original video command encoding. Do not renumber. */
+enum virgl_video_profile {
+    VIRGL_VIDEO_PROFILE_UNKNOWN = 0,
+    VIRGL_VIDEO_PROFILE_MPEG1 = 1,
+    VIRGL_VIDEO_PROFILE_MPEG2_SIMPLE = 2,
+    VIRGL_VIDEO_PROFILE_MPEG2_MAIN = 3,
+    VIRGL_VIDEO_PROFILE_MPEG4_SIMPLE = 4,
+    VIRGL_VIDEO_PROFILE_MPEG4_ADVANCED_SIMPLE = 5,
+    VIRGL_VIDEO_PROFILE_VC1_SIMPLE = 6,
+    VIRGL_VIDEO_PROFILE_VC1_MAIN = 7,
+    VIRGL_VIDEO_PROFILE_VC1_ADVANCED = 8,
+    VIRGL_VIDEO_PROFILE_H264_BASELINE = 9,
+    VIRGL_VIDEO_PROFILE_H264_CONSTRAINED_BASELINE = 10,
+    VIRGL_VIDEO_PROFILE_H264_MAIN = 11,
+    VIRGL_VIDEO_PROFILE_H264_EXTENDED = 12,
+    VIRGL_VIDEO_PROFILE_H264_HIGH = 13,
+    VIRGL_VIDEO_PROFILE_H264_HIGH10 = 14,
+    VIRGL_VIDEO_PROFILE_H264_HIGH422 = 15,
+    VIRGL_VIDEO_PROFILE_H264_HIGH444 = 16,
+    VIRGL_VIDEO_PROFILE_HEVC_MAIN = 17,
+    VIRGL_VIDEO_PROFILE_HEVC_MAIN10 = 18,
+    VIRGL_VIDEO_PROFILE_HEVC_MAIN_STILL = 19,
+    VIRGL_VIDEO_PROFILE_HEVC_MAIN12 = 20,
+    VIRGL_VIDEO_PROFILE_HEVC_MAIN444 = 21,
+    VIRGL_VIDEO_PROFILE_JPEG_BASELINE = 22,
+    VIRGL_VIDEO_PROFILE_VP9_PROFILE0 = 23,
+    VIRGL_VIDEO_PROFILE_VP9_PROFILE2 = 24,
+    VIRGL_VIDEO_PROFILE_AV1_MAIN = 25,
+};
+
+enum virgl_video_chroma_format {
+    VIRGL_VIDEO_CHROMA_400 = 0,
+    VIRGL_VIDEO_CHROMA_420 = 1,
+    VIRGL_VIDEO_CHROMA_422 = 2,
+    VIRGL_VIDEO_CHROMA_444 = 3,
+    VIRGL_VIDEO_CHROMA_440 = 4,
+    VIRGL_VIDEO_CHROMA_NONE = 5,
+};
+
 struct virgl_base_picture_desc {
-    uint16_t profile;       /* enum pipe_video_profile */
+    uint16_t profile;       /* enum virgl_video_profile */
     uint8_t entry_point;    /* enum pipe_video_entrypoint */
     uint8_t protected_playback;
     uint8_t decrypt_key[256];
