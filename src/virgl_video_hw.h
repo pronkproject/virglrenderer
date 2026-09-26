@@ -149,6 +149,11 @@ struct virgl_h264_picture_desc {
 
 struct virgl_h264_enc_seq_param
 {
+   uint32_t level_idc;
+   uint32_t max_num_ref_frames;
+   uint32_t log2_max_frame_num_minus4;
+   uint32_t log2_max_pic_order_cnt_lsb_minus4;
+   uint32_t direct_8x8_inference_flag;
    uint32_t enc_constraint_set_flags;
    uint32_t enc_frame_cropping_flag;
    uint32_t enc_frame_crop_left_offset;
@@ -207,6 +212,7 @@ struct virgl_h264_enc_pic_control
 {
     uint32_t enc_cabac_enable;
     uint32_t enc_cabac_init_idc;
+    uint32_t transform_8x8_mode_flag;
 };
 
 struct virgl_h264_slice_descriptor
@@ -230,6 +236,12 @@ struct virgl_h264_enc_picture_desc
    uint32_t intra_idr_period;
 
    uint32_t quant_i_frames;
+   uint32_t init_qp;
+   int32_t slice_qp_delta;
+   uint32_t slice_frame_num;
+   uint32_t slice_idr_pic_id;
+   uint32_t slice_pic_order_cnt_lsb;
+   uint32_t slice_cabac_init_idc;
    uint32_t quant_p_frames;
    uint32_t quant_b_frames;
 
@@ -251,6 +263,13 @@ struct virgl_h264_enc_picture_desc
 
    uint32_t num_slice_descriptors;
    struct virgl_h264_slice_descriptor slices_descriptors[128];
+
+   uint32_t num_raw_headers;
+   struct {
+      uint32_t size;
+      uint8_t type;
+      uint8_t data[256];
+   } raw_headers[8];
 
    uint8_t  picture_type; /* see enum pipe_h2645_enc_picture_type */
    uint8_t  not_referenced;
@@ -978,4 +997,3 @@ struct virgl_video_encode_feedback {
 };
 
 #endif /* VIRGL_VIDEO_HW_H */
-

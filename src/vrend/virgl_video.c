@@ -333,7 +333,7 @@ static uint32_t drm_format_from_va_fourcc(uint32_t va_fourcc)
     }
 }
 
-static void fill_video_dma_buf(struct virgl_video_dma_buf *dmabuf,
+static bool fill_video_dma_buf(struct virgl_video_dma_buf *dmabuf,
                                const VADRMPRIMESurfaceDescriptor *desc)
 {
     unsigned i, j, obj_idx;
@@ -367,15 +367,25 @@ static void fill_video_dma_buf(struct virgl_video_dma_buf *dmabuf,
                     desc->layers[i].pitch[3]);
 */
 
+    if (!desc->num_objects || desc->num_objects > ARRAY_SIZE(desc->objects) ||
+        desc->num_layers > ARRAY_SIZE(desc->layers))
+        return false;
+
     dmabuf->drm_format = drm_format_from_va_fourcc(desc->fourcc);
     dmabuf->width = desc->width;
     dmabuf->height = desc->height;
 
     for (i = 0, dmabuf->num_planes = 0; i < desc->num_layers; i++) {
-        for (j = 0; j < desc->layers[i].num_planes &&
-                    dmabuf->num_planes < ARRAY_SIZE(dmabuf->planes); j++) {
+        if (desc->layers[i].num_planes >
+            ARRAY_SIZE(desc->layers[i].object_index) ||
+            desc->layers[i].num_planes >
+            ARRAY_SIZE(dmabuf->planes) - dmabuf->num_planes)
+            return false;
+        for (j = 0; j < desc->layers[i].num_planes; j++) {
 
             obj_idx = desc->layers[i].object_index[j];
+            if (obj_idx >= desc->num_objects)
+                return false;
             plane = &dmabuf->planes[dmabuf->num_planes++];
             plane->drm_format = desc->layers[i].drm_format;
             plane->offset     = desc->layers[i].offset[j];
@@ -385,6 +395,10 @@ static void fill_video_dma_buf(struct virgl_video_dma_buf *dmabuf,
             plane->modifier   = desc->objects[obj_idx].drm_format_modifier;
         }
     }
+    for (i = 0; i < desc->num_objects; i++)
+        dmabuf->object_fds[i] = desc->objects[i].fd;
+    dmabuf->num_objects = desc->num_objects;
+    return true;
 }
 
 static struct virgl_video_dma_buf *export_video_dma_buf(
@@ -415,7 +429,12 @@ static struct virgl_video_dma_buf *export_video_dma_buf(
         goto free_dmabuf;
     }
 
-    fill_video_dma_buf(dmabuf, &desc);
+    if (!fill_video_dma_buf(dmabuf, &desc)) {
+        for (unsigned i = 0; i < desc.num_objects &&
+                             i < ARRAY_SIZE(desc.objects); i++)
+            close(desc.objects[i].fd);
+        goto free_dmabuf;
+    }
     dmabuf->flags = flags;
     dmabuf->buf   = buffer;
 
@@ -431,32 +450,34 @@ static void destroy_video_dma_buf(struct virgl_video_dma_buf *dmabuf)
     unsigned i;
 
     if (dmabuf) {
-        for (i = 0; i < dmabuf->num_planes; i++)
-            close(dmabuf->planes[i].fd);
+        for (i = 0; i < dmabuf->num_objects; i++)
+            close(dmabuf->object_fds[i]);
 
         free(dmabuf);
     }
 }
 
-static void encode_upload_picture(struct virgl_video_codec *codec,
-                                  struct virgl_video_buffer *buffer)
+static int encode_upload_picture(struct virgl_video_codec *codec,
+                                 struct virgl_video_buffer *buffer)
 {
     VAStatus va_stat;
 
     if (!callbacks || !callbacks->encode_upload_picture)
-        return;
+        return -1;
 
     va_stat = vaSyncSurface(va_dpy, buffer->va_sfc);
     if (VA_STATUS_SUCCESS != va_stat) {
         virgl_error("sync surface failed, err = 0x%x\n", va_stat);
-        return;
+        return -1;
     }
 
     if (!buffer->dmabuf)
         buffer->dmabuf = export_video_dma_buf(buffer, VIRGL_VIDEO_DMABUF_WRITE_ONLY);
 
-    if (buffer->dmabuf)
-        callbacks->encode_upload_picture(codec, buffer->dmabuf);
+    if (!buffer->dmabuf)
+        return -1;
+
+    return callbacks->encode_upload_picture(codec, buffer->dmabuf);
 }
 
 static void encode_completed(struct virgl_video_codec *codec,
@@ -572,12 +593,6 @@ int virgl_video_init(int drm_fd,
 
     driver = vaQueryVendorString(va_dpy);
     virgl_info("Driver version: %s\n", driver ? driver : "<unknown>");
-
-    if (!driver || !strstr(driver, "Mesa Gallium")) {
-        virgl_error("only supports mesa va drivers now\n");
-        virgl_video_destroy();
-        return -1;
-    }
 
     callbacks = cbs;
 
@@ -740,7 +755,7 @@ struct virgl_video_codec *virgl_video_create_codec(
     VAStatus va_stat;
     VAConfigID cfg;
     VAContextID ctx;
-    VAConfigAttrib attr;
+    VAConfigAttrib attr[2];
     VAProfile profile;
     VAEntrypoint entrypoint;
     uint32_t format;
@@ -759,15 +774,31 @@ struct virgl_video_codec *virgl_video_create_codec(
     if (!codec)
         return NULL;
 
-    attr.type = VAConfigAttribRTFormat;
-    vaGetConfigAttributes(va_dpy, profile, entrypoint, &attr, 1);
-    if (!(attr.value & format)) {
+    attr[0].type = VAConfigAttribRTFormat;
+    attr[1].type = VAConfigAttribEncPackedHeaders;
+    va_stat = vaGetConfigAttributes(va_dpy, profile, entrypoint, attr, 2);
+    if (va_stat != VA_STATUS_SUCCESS) {
+        virgl_error("query config failed, err = 0x%x\n", va_stat);
+        goto err;
+    }
+    if (!(attr[0].value & format)) {
         virgl_error("format 0x%x not supported, supported formats: 0x%x\n",
-                  format, attr.value);
+                  format, attr[0].value);
         goto err;
     }
 
-    va_stat = vaCreateConfig(va_dpy, profile, entrypoint, &attr, 1, &cfg);
+    attr[0].value = format;
+    if (entrypoint == VAEntrypointEncSlice &&
+        attr[1].value != VA_ATTRIB_NOT_SUPPORTED) {
+        attr[1].value &= VA_ENC_PACKED_HEADER_SEQUENCE |
+                         VA_ENC_PACKED_HEADER_PICTURE |
+                         VA_ENC_PACKED_HEADER_SLICE |
+                         VA_ENC_PACKED_HEADER_RAW_DATA;
+    }
+    va_stat = vaCreateConfig(va_dpy, profile, entrypoint, attr,
+                             entrypoint == VAEntrypointEncSlice &&
+                             attr[1].value != VA_ATTRIB_NOT_SUPPORTED ? 2 : 1,
+                             &cfg);
     if (VA_STATUS_SUCCESS != va_stat) {
         virgl_error("create config failed, err = 0x%x\n", va_stat);
         goto err;
@@ -909,8 +940,9 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
     if (!va_dpy || !codec || !target)
         return -1;
 
-    if (codec->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE)
-        encode_upload_picture(codec, target);
+    if (codec->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE &&
+        encode_upload_picture(codec, target))
+        return -1;
 
     codec->buffer = target;
     va_stat = vaBeginPicture(va_dpy, codec->va_ctx, target->va_sfc);
@@ -1102,7 +1134,7 @@ static void h264_fill_enc_picture_param(
 
     /* CurrPic */
     param->CurrPic.picture_id = get_enc_ref_pic(codec, desc->frame_num);
-    //CurrPic.frame_idx;
+    param->CurrPic.frame_idx = desc->frame_num;
     //CurrPic.flags;
     param->CurrPic.TopFieldOrderCnt = desc->pic_order_cnt;
     //CurrPic.BottomFieldOrderCnt;
@@ -1110,6 +1142,14 @@ static void h264_fill_enc_picture_param(
     /* ReferenceFrames */
     for (i = 0; i < ARRAY_SIZE(param->ReferenceFrames); i++)
         h264_init_picture(&param->ReferenceFrames[i]);
+    if (desc->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_P &&
+        desc->ref_idx_l0_list[0] != VA_INVALID_ID) {
+        param->ReferenceFrames[0].picture_id =
+            get_enc_ref_pic(codec, desc->ref_idx_l0_list[0]);
+        param->ReferenceFrames[0].frame_idx = desc->ref_idx_l0_list[0];
+        param->ReferenceFrames[0].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+        param->ReferenceFrames[0].TopFieldOrderCnt = desc->pic_order_cnt - 2;
+    }
 
     /* coded_buf */
     param->coded_buf = codec->va_coded_buf;
@@ -1117,8 +1157,8 @@ static void h264_fill_enc_picture_param(
     //pic_parameter_set_id;
     //seq_parameter_set_id;
     //last_picture;
-    //frame_num
-    param->pic_init_qp = desc->quant_i_frames;
+    param->frame_num = desc->slice_frame_num;
+    param->pic_init_qp = desc->init_qp;
     param->num_ref_idx_l0_active_minus1 = desc->num_ref_idx_l0_active_minus1;
     param->num_ref_idx_l1_active_minus1 = desc->num_ref_idx_l1_active_minus1;
     //chroma_qp_index_offset;
@@ -1132,7 +1172,8 @@ static void h264_fill_enc_picture_param(
     //pic_fields.bits.weighted_pred_flag
     //pic_fields.bits.weighted_bipred_idc
     //pic_fields.bits.constrained_intra_pred_flag
-    //pic_fields.bits.transform_8x8_mode_flag
+    param->pic_fields.bits.transform_8x8_mode_flag =
+        desc->pic_ctrl.transform_8x8_mode_flag;
     //pic_fields.bits.deblocking_filter_control_present_flag
     //pic_fields.bits.redundant_pic_cnt_present_flag
     //pic_fields.bits.pic_order_present_flag
@@ -1155,6 +1196,8 @@ static void h264_fill_enc_slice_param(
 
     (void)codec;
     (void)source;
+
+    param->macroblock_info = VA_INVALID_ID;
 
     /* Get the lastest slice descriptor */
     if (desc->num_slice_descriptors &&
@@ -1182,8 +1225,8 @@ static void h264_fill_enc_slice_param(
     }
 
     //pic_parameter_set_id;
-    //idr_pic_id;
-    //pic_order_cnt_lsb;
+    param->idr_pic_id = desc->slice_idr_pic_id;
+    param->pic_order_cnt_lsb = desc->slice_pic_order_cnt_lsb;
     //delta_pic_order_cnt_bottom;
     //delta_pic_order_cnt[2];
     //direct_spatial_mv_pred_flag;
@@ -1207,8 +1250,11 @@ static void h264_fill_enc_slice_param(
         param->RefPicList1[i].picture_id =
                     get_enc_ref_pic(codec, desc->ref_idx_l1_list[i]);
 
-        if (param->RefPicList0[i].picture_id != VA_INVALID_ID)
+        if (param->RefPicList0[i].picture_id != VA_INVALID_ID) {
+            param->RefPicList0[i].frame_idx = desc->ref_idx_l0_list[i];
+            param->RefPicList0[i].TopFieldOrderCnt = desc->pic_order_cnt - 2;
             param->RefPicList0[i].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+        }
 
         if (param->RefPicList1[i].picture_id != VA_INVALID_ID)
             param->RefPicList1[i].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
@@ -1228,8 +1274,8 @@ static void h264_fill_enc_slice_param(
     //chroma_weight_l1_flag;
     //chroma_weight_l1[32][2];
     //chroma_offset_l1[32][2];
-    param->cabac_init_idc = desc->pic_ctrl.enc_cabac_init_idc;
-    //slice_qp_delta;
+    param->cabac_init_idc = desc->slice_cabac_init_idc;
+    param->slice_qp_delta = desc->slice_qp_delta;
     //disable_deblocking_filter_idc;
     //slice_alpha_c0_offset_div2;
     //slice_beta_offset_div2;
@@ -1250,24 +1296,27 @@ static void h264_fill_enc_seq_param(
     (void)source;
 
     //seq_parameter_set_id;
-    param->level_idc = codec->level;
-    //intra_period;
+    param->level_idc = desc->seq.level_idc;
+    param->intra_period = desc->intra_idr_period;
     param->intra_idr_period = desc->intra_idr_period;
-    //ip_period;
+    param->ip_period = 1;
     //bits_per_second;
-    param->max_num_ref_frames = codec->max_references;
-    //picture_width_in_mbs;
-    //picture_height_in_mbs;
+    param->max_num_ref_frames = desc->seq.max_num_ref_frames;
+    param->picture_width_in_mbs = (codec->width + 15) / 16;
+    param->picture_height_in_mbs = (codec->height + 15) / 16;
 
     /* seq_fields.bits */
-    //seq_fields.bits.chroma_format_idc
-    //seq_fields.bits.frame_mbs_only_flag
+    param->seq_fields.bits.chroma_format_idc = 1;
+    param->seq_fields.bits.frame_mbs_only_flag = 1;
     //seq_fields.bits.mb_adaptive_frame_field_flag
     //seq_fields.bits.seq_scaling_matrix_present_flag
-    //seq_fields.bits.direct_8x8_inference_flag
-    //seq_fields.bits.log2_max_frame_num_minus4
+    param->seq_fields.bits.direct_8x8_inference_flag =
+        desc->seq.direct_8x8_inference_flag;
+    param->seq_fields.bits.log2_max_frame_num_minus4 =
+        desc->seq.log2_max_frame_num_minus4;
     ITEM_SET(&param->seq_fields.bits, &desc->seq, pic_order_cnt_type);
-    //seq_fields.bit.log2_max_pic_order_cnt_lsb_minus4
+    param->seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 =
+        desc->seq.log2_max_pic_order_cnt_lsb_minus4;
     //seq_fields.bit.delta_pic_order_always_zero_flag
 
     //bit_depth_luma_minus8;
@@ -1329,8 +1378,11 @@ static void h264_fill_enc_misc_param_rate_ctrl(
     param->bits_per_second = rc->peak_bitrate;
     if (desc->rate_ctrl[0].rate_ctrl_method !=
         PIPE_H2645_ENC_RATE_CONTROL_METHOD_CONSTANT) {
-        param->target_percentage = rc->target_bitrate *
-                                   param->bits_per_second / 100.0;
+        param->target_percentage = 100;
+        if (param->bits_per_second)
+            param->target_percentage =
+                MIN2(100ULL * rc->target_bitrate /
+                     param->bits_per_second, 100ULL);
     }
     //window_size;
     //initial_qp;
@@ -1566,17 +1618,80 @@ static int h264_encode_render_slice(
     return 0;
 }
 
+static int h264_encode_render_headers(
+                            struct virgl_video_codec *codec,
+                            const struct virgl_h264_enc_picture_desc *desc)
+{
+    unsigned i;
+
+    if (desc->num_raw_headers > ARRAY_SIZE(desc->raw_headers))
+        return -1;
+
+    for (i = 0; i < desc->num_raw_headers; i++) {
+        const unsigned size = desc->raw_headers[i].size;
+        VAEncPackedHeaderParameterBuffer param = {0};
+        VABufferID param_buf, data_buf;
+        VAStatus status;
+
+        if (!size || size > sizeof(desc->raw_headers[i].data))
+            return -1;
+        switch (desc->raw_headers[i].type) {
+        case 7:
+            param.type = VAEncPackedHeaderSequence;
+            break;
+        case 8:
+            param.type = VAEncPackedHeaderPicture;
+            break;
+        case 1:
+        case 5:
+            param.type = VAEncPackedHeaderSlice;
+            break;
+        default:
+            param.type = VAEncPackedHeaderRawData;
+            break;
+        }
+        param.bit_length = size * 8;
+        param.has_emulation_bytes = 1;
+        status = vaCreateBuffer(va_dpy, codec->va_ctx,
+                                VAEncPackedHeaderParameterBufferType,
+                                sizeof(param), 1, &param, &param_buf);
+        if (status != VA_STATUS_SUCCESS)
+            return -1;
+        status = vaCreateBuffer(va_dpy, codec->va_ctx,
+                                VAEncPackedHeaderDataBufferType,
+                                size, 1, (void *)desc->raw_headers[i].data,
+                                &data_buf);
+        if (status != VA_STATUS_SUCCESS) {
+            vaDestroyBuffer(va_dpy, param_buf);
+            return -1;
+        }
+        status = vaRenderPicture(va_dpy, codec->va_ctx, &param_buf, 1);
+        if (status == VA_STATUS_SUCCESS)
+            status = vaRenderPicture(va_dpy, codec->va_ctx, &data_buf, 1);
+        vaDestroyBuffer(va_dpy, data_buf);
+        vaDestroyBuffer(va_dpy, param_buf);
+        if (status != VA_STATUS_SUCCESS) {
+            virgl_error("render h264 packed header failed, err = 0x%x\n", status);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int h264_encode_bitstream(
                             struct virgl_video_codec *codec,
                             struct virgl_video_buffer *source,
                             const struct virgl_h264_enc_picture_desc *desc)
 {
     if (desc->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_IDR) {
-        h264_encode_render_sequence(codec, source, desc);
+        if (h264_encode_render_sequence(codec, source, desc))
+            return -1;
     }
 
-    h264_encode_render_picture(codec, source, desc);
-    h264_encode_render_slice(codec, source, desc);
+    if (h264_encode_render_picture(codec, source, desc) ||
+        h264_encode_render_headers(codec, desc) ||
+        h264_encode_render_slice(codec, source, desc))
+        return -1;
 
     return 0;
 }
@@ -3204,4 +3319,3 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
 
     return 0;
 }
-

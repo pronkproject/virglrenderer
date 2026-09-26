@@ -88,12 +88,14 @@ struct virgl_video_dma_buf {
     uint32_t height;
     uint32_t flags;
 
+    uint32_t num_objects;
+    int object_fds[4];
     uint32_t num_planes;
     struct virgl_video_dma_buf_plane {
         uint32_t drm_format;
         int fd;
         uint32_t size;
-        int modifier;
+        uint64_t modifier;
         uint32_t offset;
         uint32_t pitch;
     } planes[4];
@@ -112,8 +114,8 @@ struct virgl_video_callbacks {
                              const struct virgl_video_dma_buf *dmabuf);
 
     /* Upload the picture data to be encoded to the video buffer */
-    void (*encode_upload_picture)(struct virgl_video_codec *codec,
-                                  const struct virgl_video_dma_buf *dmabuf);
+    int (*encode_upload_picture)(struct virgl_video_codec *codec,
+                                 const struct virgl_video_dma_buf *dmabuf);
 
     /* Callback when encoding is complete, used to download the encoded data
      * and reference picture */
@@ -160,4 +162,3 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
                           struct virgl_video_buffer *target);
 
 #endif /* VIRGL_VIDEO_H */
-

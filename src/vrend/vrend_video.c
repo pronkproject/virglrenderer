@@ -166,13 +166,17 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
 
         /* dmabuf -> eglimage */
         if (EGL_NO_IMAGE_KHR == plane->egl_image) {
-            EGLint img_attrs[16] = {
+            EGLint img_attrs[20] = {
                 EGL_LINUX_DRM_FOURCC_EXT,       dmabuf->planes[i].drm_format,
                 EGL_WIDTH,                      dmabuf->width / (i + 1),
                 EGL_HEIGHT,                     dmabuf->height / (i + 1),
                 EGL_DMA_BUF_PLANE0_FD_EXT,      dmabuf->planes[i].fd,
                 EGL_DMA_BUF_PLANE0_OFFSET_EXT,  dmabuf->planes[i].offset,
                 EGL_DMA_BUF_PLANE0_PITCH_EXT,   dmabuf->planes[i].pitch,
+                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+                    (EGLint)(uint32_t)dmabuf->planes[i].modifier,
+                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+                    (EGLint)(uint32_t)(dmabuf->planes[i].modifier >> 32),
                 EGL_NONE
             };
 
@@ -210,10 +214,15 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
 static int sync_video_buffer_to_dmabuf(struct vrend_video_buffer *buf,
                                        const struct virgl_video_dma_buf *dmabuf)
 {
+    int ret = 0;
+
     if (!(dmabuf->flags & VIRGL_VIDEO_DMABUF_WRITE_ONLY)) {
         virgl_error("%s: dmabuf is not writable\n", __func__);
         return -1;
     }
+
+    if (dmabuf->num_planes != buf->num_planes)
+        return -1;
 
     for (unsigned i = 0; i < dmabuf->num_planes && i < buf->num_planes; i++) {
         struct vrend_video_plane *plane = &buf->planes[i];
@@ -222,18 +231,23 @@ static int sync_video_buffer_to_dmabuf(struct vrend_video_buffer *buf,
         res = vrend_renderer_ctx_res_lookup(buf->ctx->ctx, plane->res_handle);
         if (!res) {
             virgl_error("%s: res %d not found\n", __func__, plane->res_handle);
-            continue;
+            ret = -1;
+            break;
         }
 
         /* dmabuf -> eglimage */
         if (EGL_NO_IMAGE_KHR == plane->egl_image) {
-            EGLint img_attrs[16] = {
+            EGLint img_attrs[20] = {
                 EGL_LINUX_DRM_FOURCC_EXT,       dmabuf->planes[i].drm_format,
                 EGL_WIDTH,                      dmabuf->width / (i + 1),
                 EGL_HEIGHT,                     dmabuf->height / (i + 1),
                 EGL_DMA_BUF_PLANE0_FD_EXT,      dmabuf->planes[i].fd,
                 EGL_DMA_BUF_PLANE0_OFFSET_EXT,  dmabuf->planes[i].offset,
                 EGL_DMA_BUF_PLANE0_PITCH_EXT,   dmabuf->planes[i].pitch,
+                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+                    (EGLint)(uint32_t)dmabuf->planes[i].modifier,
+                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+                    (EGLint)(uint32_t)(dmabuf->planes[i].modifier >> 32),
                 EGL_NONE
             };
 
@@ -243,7 +257,8 @@ static int sync_video_buffer_to_dmabuf(struct vrend_video_buffer *buf,
 
         if (EGL_NO_IMAGE_KHR == plane->egl_image) {
             virgl_error("%s: create egl image failed\n", __func__);
-            continue;
+            ret = -1;
+            break;
         }
 
         /* eglimage -> texture */
@@ -260,13 +275,21 @@ static int sync_video_buffer_to_dmabuf(struct vrend_video_buffer *buf,
         glBindTexture(GL_TEXTURE_2D, plane->texture);
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
                             res->base.width0, res->base.height0);
+        if (glGetError() != GL_NO_ERROR) {
+            virgl_error("video source plane %u GL copy failed\n", i);
+            ret = -1;
+            break;
+        }
 
     }
+
+    if (!ret)
+        glFinish();
 
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    return 0;
+    return ret;
 }
 
 
@@ -282,7 +305,7 @@ static void vrend_video_decode_completed(
 }
 
 
-static void vrend_video_enocde_upload_picture(
+static int vrend_video_encode_upload_picture(
                                 struct virgl_video_codec *codec,
                                 const struct virgl_video_dma_buf *dmabuf)
 {
@@ -290,7 +313,7 @@ static void vrend_video_enocde_upload_picture(
 
     (void)codec;
 
-    sync_video_buffer_to_dmabuf(buf, dmabuf);
+    return sync_video_buffer_to_dmabuf(buf, dmabuf);
 }
 
 static void vrend_video_encode_completed(
@@ -303,6 +326,7 @@ static void vrend_video_encode_completed(
 {
     void *buf;
     unsigned i, size, data_size;
+    GLboolean unmapped = GL_FALSE;
     struct virgl_video_encode_feedback feedback;
     struct vrend_video_codec *cdc = vrend_video_codec(codec);
 
@@ -319,18 +343,22 @@ static void vrend_video_encode_completed(
         glBindBufferARB(cdc->dest_res->target, cdc->dest_res->gl_id);
         buf = glMapBufferRange(cdc->dest_res->target, 0,
                                cdc->dest_res->base.width0, GL_MAP_WRITE_BIT);
-        for (i = 0, data_size = 0; i < num_coded_bufs &&
-                    data_size < cdc->dest_res->base.width0; i++) {
-            size = MIN2(cdc->dest_res->base.width0 - data_size, coded_sizes[i]);
+        for (i = 0, data_size = 0; buf && i < num_coded_bufs; i++) {
+            if (coded_sizes[i] > cdc->dest_res->base.width0 - data_size)
+                break;
+            size = coded_sizes[i];
             memcpy((uint8_t *)buf + data_size, coded_bufs[i], size);
             vrend_write_to_iovec(cdc->dest_res->iov, cdc->dest_res->num_iovs,
                                  data_size, coded_bufs[i], size);
             data_size += size;
         }
-        glUnmapBuffer(cdc->dest_res->target);
+        if (buf)
+            unmapped = glUnmapBuffer(cdc->dest_res->target);
         glBindBufferARB(cdc->dest_res->target, 0);
-        feedback.stat = VIRGL_VIDEO_ENCODE_STAT_SUCCESS;
-        feedback.coded_size = data_size;
+        feedback.stat = buf && unmapped && i == num_coded_bufs ?
+            VIRGL_VIDEO_ENCODE_STAT_SUCCESS : VIRGL_VIDEO_ENCODE_STAT_FAILURE;
+        feedback.coded_size = feedback.stat == VIRGL_VIDEO_ENCODE_STAT_SUCCESS ?
+            data_size : 0;
     } else {
         virgl_warn("unexcepted coded res type\n");
         feedback.stat = VIRGL_VIDEO_ENCODE_STAT_FAILURE;
@@ -348,7 +376,7 @@ static void vrend_video_encode_completed(
 
 static struct virgl_video_callbacks video_callbacks = {
     .decode_completed           = vrend_video_decode_completed,
-    .encode_upload_picture      = vrend_video_enocde_upload_picture,
+    .encode_upload_picture      = vrend_video_encode_upload_picture,
     .encode_completed           = vrend_video_encode_completed,
 };
 
@@ -855,4 +883,3 @@ int vrend_video_end_frame(struct vrend_video_context *ctx,
 
     return virgl_video_end_frame(cdc->codec, tgt->buffer);
 }
-
